@@ -1436,6 +1436,18 @@
           "type": "boolean",
           "default": "true",
           "description": "Add keepalive fallbacks and private connection reuse for `herdr --remote`. Set false to run plain ssh unchanged."
+        },
+        {
+          "key": "remote.command.program",
+          "type": "string",
+          "default": "unset",
+          "description": "Executable Herdr spawns directly, without a local shell, to run a remote command. Placeholders are not expanded here. Unset runs `ssh`."
+        },
+        {
+          "key": "remote.command.args",
+          "type": "array of strings",
+          "default": "unset",
+          "description": "Arguments passed to `remote.command.program`. Each entry stays one argv element; `{target}` expands to the `--remote` target and `{command}` to the remote command string. Write `{{` for a literal brace."
         }
       ]
     },

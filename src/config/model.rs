@@ -1023,14 +1023,33 @@ pub struct RemoteConfig {
     /// Add keepalive fallbacks and private connection reuse for `herdr --remote`.
     /// Set false to run plain ssh unchanged. Default: true.
     pub manage_ssh_config: bool,
+    /// Local launcher that runs remote commands for `herdr --remote` and saved
+    /// SSH machines. Unset (default) runs `ssh` with Herdr's own options.
+    pub command: Option<RemoteCommandConfig>,
 }
 
 impl Default for RemoteConfig {
     fn default() -> Self {
         Self {
             manage_ssh_config: true,
+            command: None,
         }
     }
+}
+
+/// Executable and argv template Herdr spawns to run one remote command.
+/// Herdr never runs a local shell, so the program and every argument stay
+/// separate argv elements.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct RemoteCommandConfig {
+    /// Executable Herdr spawns directly, without a local shell. Placeholders are
+    /// not expanded here. Default: unset (Herdr runs `ssh`).
+    pub program: String,
+    /// Arguments passed to `remote.command.program`. Each entry stays one argv
+    /// element; `{target}` expands to the `--remote` target and `{command}` to the
+    /// remote command string. Write `{{` for a literal brace. Default: unset.
+    pub args: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]

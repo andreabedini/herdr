@@ -1,6 +1,7 @@
 mod args;
 mod attach;
 mod host;
+mod launcher;
 mod process;
 mod restart_policy;
 mod saved;

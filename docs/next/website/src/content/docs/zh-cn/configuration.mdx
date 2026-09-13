@@ -121,6 +121,25 @@ manage_ssh_config = true
 
 启用后，`herdr --remote` 会写入一份私有的临时 SSH 配置：先包含用户和系统 SSH 配置，再添加兜底的 `ServerAliveInterval` 和 `ServerAliveCountMax` 值。你自己的保活设置优先。Linux 和 macOS 客户端还会为每次远程连接使用私有的 OpenSSH control socket，以复用首次通过身份验证的连接；Windows OpenSSH 不使用此复用方式。设置 `manage_ssh_config = false` 可通过普通 `ssh` 进行远程连接，不使用 Herdr 生成的配置或 control socket。
 
+若要通过 `ssh` 以外的方式连接目标，可设置 Herdr 在本地运行的程序：
+
+```toml
+[remote.command]
+program = "openshell"
+args = [
+    "sandbox",
+    "exec",
+    "-n",
+    "{target}",
+    "--no-tty",
+    "--no-login-shell",
+    "--",
+    "{command}",
+]
+```
+
+Herdr 会用这个参数向量直接启动 `program`；本地不经过任何 shell，因此无论内容如何，`{target}` 和 `{command}` 都各自保持为一个参数。`{target}` 是传给 `--remote` 的值，`{command}` 是 Herdr 已经构造好的远程命令，所以该程序必须像 `ssh target "<command>"` 那样在目标上运行该命令，并保持 stdin 与 stdout 连通：长时间运行的客户端桥接和远程安装都要用到它们。同一个启动器用于所有远程命令，包括已保存的 SSH 机器；Herdr 不会为它生成 SSH 配置，因此 `manage_ssh_config` 不再适用。无法使用的启动器配置会报错，而不会静默回退到 `ssh`。
+
 ## 按键绑定
 
 有关前缀键的引导式介绍和经过验证的免前缀配置，请参阅[键盘](/docs/keyboard/)。

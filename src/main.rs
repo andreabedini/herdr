@@ -403,6 +403,15 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # force keepalive or multiplexing off, it only stops herdr from adding its own.
 # manage_ssh_config = true
 
+# Launch remote commands through a program other than ssh. herdr spawns the
+# executable directly with this argument vector, so no local shell is involved
+# and {target} (the --remote target) and {command} (the remote command herdr
+# builds) each stay exactly one argument. The program must run that command on
+# the target with stdin and stdout connected, the way ssh does.
+# [remote.command]
+# program = "openshell"
+# args = ["sandbox", "exec", "-n", "{target}", "--no-tty", "--no-login-shell", "--", "{command}"]
+
 [experimental]
 # Allow launching herdr from inside a herdr-managed pane.
 # allow_nested = false

@@ -121,6 +121,25 @@ manage_ssh_config = true
 
 When enabled, `herdr --remote` writes a private temporary SSH config that includes your user and system SSH configs first, then adds fallback `ServerAliveInterval` and `ServerAliveCountMax` values. Your own keepalive settings win. Linux and macOS clients also use a private per-attach OpenSSH control socket to reuse the first authenticated connection; Windows OpenSSH does not. Set `manage_ssh_config = false` to run remote attach through plain `ssh` without Herdr's generated config or control socket.
 
+To reach the target through something other than `ssh`, set the program Herdr runs locally:
+
+```toml
+[remote.command]
+program = "openshell"
+args = [
+    "sandbox",
+    "exec",
+    "-n",
+    "{target}",
+    "--no-tty",
+    "--no-login-shell",
+    "--",
+    "{command}",
+]
+```
+
+Herdr spawns `program` directly with this argument vector; no local shell is involved, so `{target}` and `{command}` each stay exactly one argument whatever they contain. `{target}` is the value passed to `--remote` and `{command}` is the remote command Herdr already builds, so the program must run that command on the target the way `ssh target "<command>"` does, with stdin and stdout connected: the long-running client bridge and the remote install both use them. The same launcher runs every remote command, including saved SSH machines, and `manage_ssh_config` no longer applies because Herdr generates no SSH config for it. A launcher that cannot be used is an error rather than a silent fall back to `ssh`.
+
 ## Keybindings
 
 For a guided introduction to the prefix and a vetted prefix-free setup, see [Keyboard](/docs/keyboard/).

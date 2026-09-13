@@ -1,10 +1,10 @@
 use std::io;
 use std::path::PathBuf;
 
-use super::attach::{find_installed_remote_herdr, RemoteSsh, SshStdioBridge};
+use super::attach::{find_installed_remote_herdr, RemoteRunner, RemoteStdioBridge};
 
 pub(crate) struct SavedSshBridge {
-    _bridge: SshStdioBridge,
+    _bridge: RemoteStdioBridge,
 }
 
 pub(crate) struct SavedSshStream {
@@ -17,15 +17,15 @@ pub(crate) fn connect_saved_ssh(
     target: &str,
     session: &str,
 ) -> io::Result<SavedSshStream> {
-    let ssh = validated_saved_ssh(profile_id, target, session)?;
-    let remote_herdr = find_installed_remote_herdr(&ssh)?;
+    let runner = validated_saved_ssh(profile_id, target, session)?;
+    let remote_herdr = find_installed_remote_herdr(&runner)?;
     let path = saved_bridge_path(profile_id);
-    let bridge = SshStdioBridge::start(
+    let bridge = RemoteStdioBridge::start(
         target.to_owned(),
         remote_herdr,
         path.clone(),
         session.to_owned(),
-        ssh.options(),
+        runner.launcher().clone(),
         true,
     )?;
     let stream = crate::ipc::connect_local_stream(&path)?;
@@ -37,13 +37,13 @@ pub(crate) fn connect_saved_ssh(
 
 pub(crate) struct SavedSshApiBridge {
     path: PathBuf,
-    bridge: SshStdioBridge,
+    bridge: RemoteStdioBridge,
 }
 
 impl SavedSshApiBridge {
     pub(crate) fn start(profile_id: &str, target: &str, session: &str) -> io::Result<Self> {
-        let ssh = validated_saved_ssh(profile_id, target, session)?;
-        let remote_herdr = super::attach::find_installed_remote_api_herdr(&ssh, session)?;
+        let runner = validated_saved_ssh(profile_id, target, session)?;
+        let remote_herdr = super::attach::find_installed_remote_api_herdr(&runner, session)?;
         let command = super::attach::remote_api_bridge_command(&remote_herdr, session, false);
         let path = crate::platform::remote_bridge_endpoint_path(
             &format!("herdr-api-ssh-{}-{profile_id}.sock", std::process::id()),
@@ -53,11 +53,11 @@ impl SavedSshApiBridge {
                 &profile_id[..16]
             ),
         );
-        let bridge = SshStdioBridge::start_command(
+        let bridge = RemoteStdioBridge::start_command(
             target.to_owned(),
             command,
             path.clone(),
-            ssh.options(),
+            runner.launcher().clone(),
             true,
         )?;
         Ok(Self { path, bridge })
@@ -114,11 +114,11 @@ fn saved_bridge_path(profile_id: &str) -> PathBuf {
     crate::platform::remote_bridge_endpoint_path(&readable, &short)
 }
 
-fn validated_saved_ssh(profile_id: &str, target: &str, session: &str) -> io::Result<RemoteSsh> {
+fn validated_saved_ssh(profile_id: &str, target: &str, session: &str) -> io::Result<RemoteRunner> {
     validate_profile_path_id(profile_id)?;
     crate::session::validate_name(session)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-    Ok(RemoteSsh::new_noninteractive(target.to_owned()))
+    RemoteRunner::new_noninteractive(target.to_owned())
 }
 
 fn validate_profile_path_id(profile_id: &str) -> io::Result<()> {

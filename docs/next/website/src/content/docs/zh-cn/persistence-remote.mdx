@@ -71,6 +71,8 @@ herdr --remote workbox
 
 默认情况下,`herdr --remote` 通过一个临时 SSH 配置运行远程设置和桥接: 先包含你的 SSH 配置,再补充兜底的保活设置。已有的用户保活设置优先。Linux 和 macOS 客户端还会添加一个私有的单次连接 control socket 来复用连接;Windows OpenSSH 不使用此方式。设置 `[remote].manage_ssh_config = false` 可以不用 Herdr 生成的配置或 control socket,而使用普通 `ssh`。
 
+`ssh` 只是默认启动器。若要通过其他程序（例如沙箱或容器 CLI）运行远程命令，请设置 `[remote.command]`；参见[配置](/docs/configuration/#remote-attach)。
+
 远程连接使用正常的 OpenSSH 认证。如果在非交互式 shell、脚本、CI 或移动终端中无法输入私钥口令，请先将密钥加载到 ssh-agent：
 
 ```bash
