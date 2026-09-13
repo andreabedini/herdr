@@ -1,11 +1,10 @@
 //! Remote thin-client attach over remote-command stdio.
 //!
-//! `ssh` is the default launcher; `[remote.command]` can replace the local
-//! program without changing the target and remote command Herdr builds.
+//! `[remote.command]` says which local program runs a remote command, and its
+//! default value is Herdr's own ssh invocation; replacing it changes neither the
+//! target nor the remote command Herdr builds.
 
-use super::launcher::{
-    configured_launcher, ConfiguredLauncher, ManagedSshOptions, RemoteLauncher, RemoteStdin,
-};
+use super::launcher::{ManagedSshOptions, RemoteLauncher, RemoteStdin};
 use super::{args::*, process::wait_with_output_timeout, restart_policy::*, shell_quote};
 use base64::Engine as _;
 use std::collections::BTreeMap;
@@ -523,9 +522,7 @@ impl Drop for ManagedSshConfig {
 pub(super) struct RemoteRunner {
     target: String,
     session_name: String,
-    // Held only so the generated config outlives the commands that use it; the
-    // launcher carries the paths.
-    _managed_config: Option<ManagedSshConfig>,
+    managed_config: Option<ManagedSshConfig>,
     launcher: RemoteLauncher,
     noninteractive: bool,
 }
@@ -536,62 +533,52 @@ impl RemoteRunner {
         config: &crate::config::RemoteConfig,
         session_name: String,
     ) -> io::Result<Self> {
-        Ok(Self::with_launcher(
-            target,
-            session_name,
-            configured_launcher(config, false)?,
-            false,
-        ))
+        Self::with_config(target, session_name, config, false)
     }
 
     /// Runner for background callers (saved SSH machines) that cannot answer a
     /// prompt, so they never get the generated SSH config or its control socket.
     pub(super) fn new_noninteractive(target: String) -> io::Result<Self> {
-        let launcher = configured_launcher(&crate::config::Config::load().config.remote, true)?;
-        Ok(Self::with_launcher(
+        Self::with_config(
             target,
             crate::session::DEFAULT_SESSION_NAME.into(),
-            launcher,
+            &crate::config::Config::load().config.remote,
             true,
-        ))
+        )
     }
 
-    fn with_launcher(
+    fn with_config(
         target: String,
         session_name: String,
-        launcher: ConfiguredLauncher,
+        config: &crate::config::RemoteConfig,
         noninteractive: bool,
-    ) -> Self {
-        let (managed_config, launcher) = match launcher {
-            ConfiguredLauncher::Ssh { manage_config } => {
-                let managed_config =
-                    manage_config
-                        .then(write_managed_ssh_config)
-                        .and_then(|result| {
-                            result
-                                .inspect_err(|err| {
-                                    tracing::debug!(
-                                        %err,
-                                        "could not write managed ssh config; using plain ssh"
-                                    );
-                                })
-                                .ok()
-                        });
-                let options = managed_config
-                    .as_ref()
-                    .map(|config: &ManagedSshConfig| config.options.clone());
-                (managed_config, RemoteLauncher::ssh(options, noninteractive))
-            }
-            ConfiguredLauncher::Program(program) => (None, RemoteLauncher::Program(program)),
-        };
+    ) -> io::Result<Self> {
+        let launcher = RemoteLauncher::new(&config.command)?;
+        // Generating the private SSH config is only worth anything to a launcher
+        // that asks for Herdr's OpenSSH options.
+        let manage_config =
+            config.manage_ssh_config && launcher.uses_ssh_options() && !noninteractive;
+        let managed_config = manage_config
+            .then(write_managed_ssh_config)
+            .and_then(|result| {
+                result
+                    .inspect_err(|err| {
+                        tracing::debug!(%err, "could not write managed ssh config; using plain ssh");
+                    })
+                    .ok()
+            });
+        let launcher = launcher.with_ssh_options(
+            managed_config.as_ref().map(|config| config.options.clone()),
+            noninteractive,
+        );
 
-        Self {
+        Ok(Self {
             target,
             session_name,
-            _managed_config: managed_config,
+            managed_config,
             launcher,
             noninteractive,
-        }
+        })
     }
 
     fn target(&self) -> &str {
@@ -834,7 +821,11 @@ fn remote_install_commit_script(tmp_path: &str, dest_path: &str) -> String {
 
 impl Drop for RemoteRunner {
     fn drop(&mut self) {
-        let Some(mut command) = self.launcher.control_exit_command(&self.target) else {
+        let Some(mut command) = self
+            .managed_config
+            .as_ref()
+            .and_then(|config| config.options.control_exit_command(&self.target))
+        else {
             return;
         };
 
@@ -2956,7 +2947,8 @@ mod tests {
             remote_herdr,
             socket.clone(),
             "default".to_string(),
-            RemoteLauncher::ssh(None, false),
+            RemoteLauncher::new(&crate::config::RemoteCommandConfig::default())
+                .expect("default launcher"),
             false,
         )
         .expect("start bridge listener");
@@ -3077,7 +3069,8 @@ mod tests {
             remote_herdr,
             socket.clone(),
             "default".to_string(),
-            RemoteLauncher::ssh(None, false),
+            RemoteLauncher::new(&crate::config::RemoteCommandConfig::default())
+                .expect("default launcher"),
             false,
         )
         .expect("start bridge listener");
@@ -3163,12 +3156,13 @@ mod tests {
     }
 
     fn test_runner(config: &crate::config::RemoteConfig, noninteractive: bool) -> RemoteRunner {
-        RemoteRunner::with_launcher(
+        RemoteRunner::with_config(
             "example".to_string(),
             crate::session::DEFAULT_SESSION_NAME.into(),
-            configured_launcher(config, noninteractive).expect("valid launcher configuration"),
+            config,
             noninteractive,
         )
+        .expect("valid launcher configuration")
     }
 
     fn command_args(command: &Command) -> Vec<String> {
@@ -3182,7 +3176,7 @@ mod tests {
     #[test]
     fn remote_ssh_command_uses_managed_config_when_present() {
         let runner = test_runner(&crate::config::RemoteConfig::default(), false);
-        let managed_config = runner._managed_config.as_ref().expect("managed ssh config");
+        let managed_config = runner.managed_config.as_ref().expect("managed ssh config");
         let config_path = managed_config.options.config_path.clone();
         let control_path = managed_config
             .options
@@ -3220,7 +3214,9 @@ mod tests {
         assert!(contents.contains("ServerAliveInterval 15"));
         assert!(contents.contains("ServerAliveCountMax 4"));
 
-        let launcher = RemoteLauncher::ssh(Some(managed_config.options.clone()), false);
+        let launcher = RemoteLauncher::new(&crate::config::RemoteCommandConfig::default())
+            .expect("default launcher")
+            .with_ssh_options(Some(managed_config.options.clone()), false);
         let args = command_args(&launcher.command("example", "herdr", RemoteStdin::Piped));
         assert_eq!(
             args,
@@ -3266,7 +3262,7 @@ mod tests {
             assert!(args.iter().any(|arg| arg == required), "missing {required}");
         }
         assert!(!args.iter().any(|arg| arg == "-F"));
-        assert!(runner._managed_config.is_none());
+        assert!(runner.managed_config.is_none());
     }
 
     #[test]
@@ -3347,7 +3343,7 @@ mod tests {
     fn remote_ssh_command_is_plain_without_managed_config() {
         let config = crate::config::RemoteConfig {
             manage_ssh_config: false,
-            command: None,
+            ..Default::default()
         };
         let runner = test_runner(&config, false);
 
@@ -3367,7 +3363,7 @@ mod tests {
     fn configured_remote_command_replaces_every_ssh_invocation() {
         let config = crate::config::RemoteConfig {
             manage_ssh_config: true,
-            command: Some(crate::config::RemoteCommandConfig {
+            command: crate::config::RemoteCommandConfig {
                 program: "openshell".to_string(),
                 args: [
                     "sandbox",
@@ -3379,10 +3375,10 @@ mod tests {
                     "--",
                     "{command}",
                 ]
-                .iter()
-                .map(|arg| (*arg).to_string())
+                .into_iter()
+                .map(str::to_owned)
                 .collect(),
-            }),
+            },
         };
         let runner = test_runner(&config, false);
 
@@ -3411,20 +3407,27 @@ mod tests {
             );
         }
         // A configured launcher owns no generated SSH config or control socket.
-        assert!(runner._managed_config.is_none());
+        assert!(runner.managed_config.is_none());
     }
 
     #[test]
     fn invalid_remote_command_configuration_fails_the_attach() {
         let config = crate::config::RemoteConfig {
             manage_ssh_config: true,
-            command: Some(crate::config::RemoteCommandConfig {
+            command: crate::config::RemoteCommandConfig {
                 program: "openshell".to_string(),
                 args: vec!["sandbox".to_string(), "exec".to_string()],
-            }),
+            },
         };
 
-        let error = configured_launcher(&config, false).expect_err("rejected configuration");
+        let Err(error) = RemoteRunner::with_config(
+            "example".to_string(),
+            crate::session::DEFAULT_SESSION_NAME.into(),
+            &config,
+            false,
+        ) else {
+            panic!("an unusable launcher must fail the attach");
+        };
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(error.to_string().contains("remote.command.args"), "{error}");

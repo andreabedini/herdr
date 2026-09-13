@@ -1435,19 +1435,19 @@
           "key": "remote.manage_ssh_config",
           "type": "boolean",
           "default": "true",
-          "description": "Add keepalive fallbacks and private connection reuse for `herdr --remote`. Set false to run plain ssh unchanged."
+          "description": "Add keepalive fallbacks and private connection reuse to the `{ssh_options}` of `remote.command`. Set false to run ssh unchanged."
         },
         {
           "key": "remote.command.program",
           "type": "string",
-          "default": "unset",
-          "description": "Executable Herdr spawns directly, without a local shell, to run a remote command. Placeholders are not expanded here. Unset runs `ssh`."
+          "default": "\"ssh\"",
+          "description": "Executable Herdr spawns directly, without a local shell, to run one remote command. Placeholders are not expanded here."
         },
         {
           "key": "remote.command.args",
           "type": "array of strings",
-          "default": "unset",
-          "description": "Arguments passed to `remote.command.program`. Each entry stays one argv element; `{target}` expands to the `--remote` target and `{command}` to the remote command string. Write `{{` for a literal brace."
+          "default": "[\"{ssh_options}\", \"-T\", \"{target}\", \"{command}\"]",
+          "description": "Arguments passed to `remote.command.program`. Each entry stays one argv element: `{target}` expands to the `--remote` target and `{command}` to the remote command string. `{ssh_options}` must stand alone and expands to the OpenSSH options Herdr manages for the call, so only an ssh command wants it. Write `{{` for a literal brace."
         }
       ]
     },

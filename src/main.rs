@@ -393,7 +393,7 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # resume_agents_on_restore = true
 
 [remote]
-# Whether herdr manages the ssh config used for `herdr --remote`.
+# Whether herdr manages the ssh config expanded by {ssh_options} below.
 # When true (default), herdr runs remote ssh through a generated config that
 # includes your ~/.ssh/config first and adds ServerAliveInterval/
 # ServerAliveCountMax as fallbacks (so any keepalive values you set yourself
@@ -403,11 +403,17 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # force keepalive or multiplexing off, it only stops herdr from adding its own.
 # manage_ssh_config = true
 
-# Launch remote commands through a program other than ssh. herdr spawns the
-# executable directly with this argument vector, so no local shell is involved
-# and {target} (the --remote target) and {command} (the remote command herdr
-# builds) each stay exactly one argument. The program must run that command on
-# the target with stdin and stdout connected, the way ssh does.
+# The local program that runs one remote command. herdr spawns it directly with
+# this argument vector, so no local shell is involved and {target} (the --remote
+# target) and {command} (the remote command herdr builds) each stay exactly one
+# argument. {ssh_options} stands alone and expands to the OpenSSH options herdr
+# manages for the call, so only an ssh command line wants it.
+# [remote.command]
+# program = "ssh"
+# args = ["{ssh_options}", "-T", "{target}", "{command}"]
+
+# Replace both to reach the target through something else. The program must run
+# the command on the target with stdin and stdout connected, the way ssh does.
 # [remote.command]
 # program = "openshell"
 # args = ["sandbox", "exec", "-n", "{target}", "--no-tty", "--no-login-shell", "--", "{command}"]

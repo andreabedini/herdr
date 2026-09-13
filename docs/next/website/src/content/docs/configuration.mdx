@@ -121,7 +121,17 @@ manage_ssh_config = true
 
 When enabled, `herdr --remote` writes a private temporary SSH config that includes your user and system SSH configs first, then adds fallback `ServerAliveInterval` and `ServerAliveCountMax` values. Your own keepalive settings win. Linux and macOS clients also use a private per-attach OpenSSH control socket to reuse the first authenticated connection; Windows OpenSSH does not. Set `manage_ssh_config = false` to run remote attach through plain `ssh` without Herdr's generated config or control socket.
 
-To reach the target through something other than `ssh`, set the program Herdr runs locally:
+`ssh` is not built in; it is the default value of `remote.command`, the local program that runs one remote command:
+
+```toml
+[remote.command]
+program = "ssh"
+args = ["{ssh_options}", "-T", "{target}", "{command}"]
+```
+
+Herdr spawns `program` directly with this argument vector. No local shell is involved, so `{target}` (the value passed to `--remote`) and `{command}` (the remote command Herdr builds) each stay exactly one argument whatever they contain. `{ssh_options}` must stand alone as its own entry and expands to the OpenSSH options Herdr manages for that call: the generated config and control socket above, the non-interactive options saved machines need, and `-n` for commands that do not read stdin. Only an ssh command line wants it.
+
+Replace both to reach the target through something else, for example a sandbox, container, or cluster CLI:
 
 ```toml
 [remote.command]
@@ -138,7 +148,7 @@ args = [
 ]
 ```
 
-Herdr spawns `program` directly with this argument vector; no local shell is involved, so `{target}` and `{command}` each stay exactly one argument whatever they contain. `{target}` is the value passed to `--remote` and `{command}` is the remote command Herdr already builds, so the program must run that command on the target the way `ssh target "<command>"` does, with stdin and stdout connected: the long-running client bridge and the remote install both use them. The same launcher runs every remote command, including saved SSH machines, and `manage_ssh_config` no longer applies because Herdr generates no SSH config for it. A launcher that cannot be used is an error rather than a silent fall back to `ssh`.
+The program must run that command on the target the way `ssh target "<command>"` does, with stdin and stdout connected: the long-running client bridge and the remote install both use them. The same launcher runs every remote command, including saved SSH machines. Without `{ssh_options}` Herdr generates no SSH config for it, so `manage_ssh_config` has nothing to apply to. A launcher Herdr cannot use is an error, not a silent fall back.
 
 ## Keybindings
 

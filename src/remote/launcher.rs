@@ -1,21 +1,22 @@
 //! Local launcher for remote commands.
 //!
-//! A remote operation stays `target` + remote command string. This module owns
-//! the one point where that pair becomes a local process: the built-in SSH
-//! launcher, or the program and argv template from `[remote.command]`. Both
-//! spawn an executable with an argv vector, so no local shell is ever involved
-//! and a remote command keeps its own quoting, `$`, and `;` intact.
+//! A remote operation stays `target` + remote command string. `[remote.command]`
+//! says which local program runs that pair, and `ssh` is the default value of
+//! that setting rather than a separate path: Herdr always expands one argv
+//! template and spawns the program directly, so no local shell is involved and a
+//! remote command keeps its own quoting, `$`, and `;` intact.
 //!
-//! The remote command string itself keeps SSH semantics: the launched program
-//! hands it to the remote side, which runs it the way `ssh target "<command>"`
-//! would.
+//! The launched program must run the remote command on the target the way
+//! `ssh target "<command>"` does, with stdin and stdout connected.
 
 use std::ffi::OsString;
+use std::io;
 use std::path::PathBuf;
 use std::process::Command;
 
 const TARGET_PLACEHOLDER: &str = "target";
 const COMMAND_PLACEHOLDER: &str = "command";
+const SSH_OPTIONS_PLACEHOLDER: &str = "ssh_options";
 
 /// Stdin disposition the caller needs from the launched process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,25 +35,115 @@ pub(super) struct ManagedSshOptions {
     pub(super) control_path: Option<PathBuf>,
 }
 
-/// How Herdr launches `remote_command` on `target` locally.
+impl ManagedSshOptions {
+    fn apply(&self, command: &mut Command) {
+        command.arg("-F").arg(&self.config_path);
+        if let Some(control_path) = &self.control_path {
+            command
+                .arg("-S")
+                .arg(control_path)
+                .arg("-o")
+                .arg("ControlMaster=auto")
+                .arg("-o")
+                .arg("ControlPersist=yes");
+        }
+    }
+
+    /// Shutdown for the connection-reuse master, when this config opened one.
+    pub(super) fn control_exit_command(&self, target: &str) -> Option<Command> {
+        self.control_path.as_ref()?;
+        let mut command = Command::new("ssh");
+        self.apply(&mut command);
+        command
+            .arg("-O")
+            .arg("exit")
+            .arg("-o")
+            .arg("BatchMode=yes")
+            .arg(target);
+        Some(command)
+    }
+}
+
+/// The local program Herdr runs to execute one remote command.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum RemoteLauncher {
-    /// Built-in OpenSSH launcher. The default, and the only launcher that owns
-    /// generated SSH config and connection reuse.
-    Ssh {
-        options: Option<ManagedSshOptions>,
-        noninteractive: bool,
-    },
-    /// Configured executable plus argv template from `[remote.command]`.
-    Program(RemoteProgram),
+pub(super) struct RemoteLauncher {
+    program: OsString,
+    args: Vec<Arg>,
+    ssh: SshOptions,
+}
+
+/// Values `{ssh_options}` expands to. Only a template that asks for them is
+/// given Herdr's OpenSSH options, so a program that is not ssh gets none.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SshOptions {
+    managed: Option<ManagedSshOptions>,
+    noninteractive: bool,
 }
 
 impl RemoteLauncher {
-    pub(super) fn ssh(options: Option<ManagedSshOptions>, noninteractive: bool) -> Self {
-        Self::Ssh {
-            options,
-            noninteractive,
+    /// Launcher for `[remote.command]`, whose default is Herdr's `ssh` command.
+    ///
+    /// An unusable template is an error rather than a fall back to some other
+    /// program: the launcher is how the operator chose to reach the target.
+    pub(super) fn new(config: &crate::config::RemoteCommandConfig) -> io::Result<Self> {
+        Self::parse(config).map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
+    }
+
+    fn parse(config: &crate::config::RemoteCommandConfig) -> Result<Self, String> {
+        let program = config.program.trim();
+        if program.is_empty() {
+            return Err("remote.command.program must name an executable".to_string());
         }
+        if ArgTemplate::parse(program).is_ok_and(|template| !template.is_literal()) {
+            return Err(
+                "remote.command.program is spawned directly and does not expand placeholders; \
+                 put the placeholders in remote.command.args"
+                    .to_string(),
+            );
+        }
+
+        let mut args = Vec::with_capacity(config.args.len());
+        for (index, arg) in config.args.iter().enumerate() {
+            args.push(
+                Arg::parse(arg)
+                    .map_err(|error| format!("remote.command.args[{index}]: {error}"))?,
+            );
+        }
+        for (placeholder, segment) in [
+            (TARGET_PLACEHOLDER, Segment::Target),
+            (COMMAND_PLACEHOLDER, Segment::Command),
+        ] {
+            if !args.iter().any(|arg| arg.contains(&segment)) {
+                return Err(format!(
+                    "remote.command.args must include the {{{placeholder}}} placeholder so \
+                     `{program}` receives the remote {placeholder}"
+                ));
+            }
+        }
+
+        Ok(Self {
+            program: OsString::from(program),
+            args,
+            ssh: SshOptions::default(),
+        })
+    }
+
+    /// Whether the template asks for the OpenSSH options Herdr manages, and so
+    /// whether generating a private SSH config for it is worth anything.
+    pub(super) fn uses_ssh_options(&self) -> bool {
+        self.args.iter().any(|arg| matches!(arg, Arg::SshOptions))
+    }
+
+    pub(super) fn with_ssh_options(
+        mut self,
+        managed: Option<ManagedSshOptions>,
+        noninteractive: bool,
+    ) -> Self {
+        self.ssh = SshOptions {
+            managed,
+            noninteractive,
+        };
+        self
     }
 
     /// Local process that runs `remote_command` on `target`.
@@ -65,155 +156,93 @@ impl RemoteLauncher {
         remote_command: &str,
         stdin: RemoteStdin,
     ) -> Command {
-        match self {
-            Self::Ssh {
-                options,
-                noninteractive,
-            } => {
-                let mut command = Command::new("ssh");
-                apply_managed_ssh_options(&mut command, options.as_ref());
-                if *noninteractive {
-                    apply_noninteractive_ssh_options(&mut command);
+        let mut command = Command::new(&self.program);
+        for arg in &self.args {
+            match arg {
+                Arg::Template(template) => {
+                    command.arg(template.expand(target, remote_command));
                 }
-                command.arg("-T").arg(target);
-                if matches!(stdin, RemoteStdin::Null) {
-                    // Windows OpenSSH can still read the console with stdin redirected to NUL.
-                    command.arg("-n");
-                }
-                command.arg(remote_command);
-                command
+                Arg::SshOptions => self.ssh.apply(&mut command, stdin),
             }
-            Self::Program(program) => program.command(target, remote_command),
         }
-    }
-
-    /// Launcher for a metadata-only probe: SSH drops the shared control socket
-    /// and refuses prompts, a configured program is used unchanged.
-    pub(super) fn probe(&self) -> Self {
-        match self {
-            Self::Ssh { .. } => Self::ssh(None, true),
-            Self::Program(program) => Self::Program(program.clone()),
-        }
-    }
-
-    /// Shutdown for a connection-reuse master, when the launcher owns one.
-    pub(super) fn control_exit_command(&self, target: &str) -> Option<Command> {
-        let Self::Ssh { options, .. } = self else {
-            return None;
-        };
-        let options = options
-            .as_ref()
-            .filter(|options| options.control_path.is_some())?;
-        let mut command = Command::new("ssh");
-        apply_managed_ssh_options(&mut command, Some(options));
         command
-            .arg("-O")
-            .arg("exit")
-            .arg("-o")
-            .arg("BatchMode=yes")
-            .arg(target);
-        Some(command)
+    }
+
+    /// Launcher for a metadata-only probe: it never reuses the shared
+    /// connection and never waits on a prompt.
+    pub(super) fn probe(&self) -> Self {
+        self.clone().with_ssh_options(None, true)
     }
 
     /// Program name for spawn diagnostics.
     pub(super) fn program_name(&self) -> String {
-        match self {
-            Self::Ssh { .. } => "ssh".to_string(),
-            Self::Program(program) => program.program.to_string_lossy().into_owned(),
+        self.program.to_string_lossy().into_owned()
+    }
+}
+
+impl SshOptions {
+    fn apply(&self, command: &mut Command, stdin: RemoteStdin) {
+        if let Some(managed) = &self.managed {
+            managed.apply(command);
+        }
+        if self.noninteractive {
+            command
+                .arg("-o")
+                .arg("BatchMode=yes")
+                .arg("-o")
+                .arg("NumberOfPasswordPrompts=0")
+                .arg("-o")
+                .arg("StrictHostKeyChecking=yes")
+                .arg("-o")
+                .arg("ConnectTimeout=10")
+                .arg("-o")
+                .arg("ConnectionAttempts=1")
+                .arg("-o")
+                .arg("ServerAliveInterval=15")
+                .arg("-o")
+                .arg("ServerAliveCountMax=4");
+        }
+        if matches!(stdin, RemoteStdin::Null) {
+            // Windows OpenSSH can still read the console with stdin redirected to NUL.
+            command.arg("-n");
         }
     }
 }
 
-/// Launcher selected by `[remote]`, before Herdr generates the SSH config that
-/// only the SSH launcher uses.
+/// One configured argument.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum ConfiguredLauncher {
-    Ssh { manage_config: bool },
-    Program(RemoteProgram),
+enum Arg {
+    /// Text and placeholders that always expand to exactly one argv element.
+    Template(ArgTemplate),
+    /// Herdr's OpenSSH options for this call: zero or more argv elements.
+    SshOptions,
 }
 
-/// Launcher for `[remote]` configuration.
-///
-/// An invalid `[remote.command]` is an error rather than a silent fall back to
-/// `ssh`: the launcher is how the operator chose to reach the target.
-/// `noninteractive` callers never get the generated SSH config, because they
-/// cannot answer a prompt or clean up a shared control socket interactively.
-pub(super) fn configured_launcher(
-    config: &crate::config::RemoteConfig,
-    noninteractive: bool,
-) -> std::io::Result<ConfiguredLauncher> {
-    match config.command.as_ref() {
-        Some(command) => RemoteProgram::from_config(command)
-            .map(ConfiguredLauncher::Program)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error)),
-        None => Ok(ConfiguredLauncher::Ssh {
-            manage_config: config.manage_ssh_config && !noninteractive,
-        }),
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct RemoteProgram {
-    program: OsString,
-    args: Vec<ArgTemplate>,
-}
-
-impl RemoteProgram {
-    fn from_config(config: &crate::config::RemoteCommandConfig) -> Result<Self, String> {
-        let program = config.program.trim();
-        if program.is_empty() {
-            return Err("remote.command.program must name an executable".to_string());
-        }
-        if ArgTemplate::parse(program).is_ok_and(|template| !template.is_literal()) {
-            return Err(
-                "remote.command.program is spawned directly and does not expand placeholders; \
-                 put {target} and {command} in remote.command.args"
-                    .to_string(),
-            );
-        }
-
-        let mut args = Vec::with_capacity(config.args.len());
-        for (index, arg) in config.args.iter().enumerate() {
-            args.push(
-                ArgTemplate::parse(arg)
-                    .map_err(|error| format!("remote.command.args[{index}]: {error}"))?,
-            );
-        }
-        for (placeholder, present) in [
-            (
-                TARGET_PLACEHOLDER,
-                args.iter().any(|arg| arg.contains(&Segment::Target)),
-            ),
-            (
-                COMMAND_PLACEHOLDER,
-                args.iter().any(|arg| arg.contains(&Segment::Command)),
-            ),
-        ] {
-            if !present {
-                return Err(format!(
-                    "remote.command.args must include the {{{placeholder}}} placeholder so \
-                     `{program}` receives the remote {placeholder}"
-                ));
+impl Arg {
+    fn parse(raw: &str) -> Result<Self, String> {
+        let template = ArgTemplate::parse(raw)?;
+        if template.contains(&Segment::SshOptions) {
+            if template.0.len() == 1 {
+                return Ok(Self::SshOptions);
             }
+            return Err(format!(
+                "{{{SSH_OPTIONS_PLACEHOLDER}}} expands to a list of options, \
+                 so it must be an argument of its own"
+            ));
         }
-
-        Ok(Self {
-            program: OsString::from(program),
-            args,
-        })
+        Ok(Self::Template(template))
     }
 
-    fn command(&self, target: &str, remote_command: &str) -> Command {
-        let mut command = Command::new(&self.program);
-        for arg in &self.args {
-            command.arg(arg.expand(target, remote_command));
+    fn contains(&self, needle: &Segment) -> bool {
+        match self {
+            Self::Template(template) => template.contains(needle),
+            Self::SshOptions => matches!(needle, Segment::SshOptions),
         }
-        command
     }
 }
 
-/// One configured argument. Expansion never splits it into more than one argv
-/// element, whatever the target or the remote command contain.
+/// Text and placeholders for one argv element. Expansion never splits it into
+/// more than one element, whatever the target or the remote command contain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ArgTemplate(Vec<Segment>);
 
@@ -222,6 +251,7 @@ enum Segment {
     Literal(String),
     Target,
     Command,
+    SshOptions,
 }
 
 impl ArgTemplate {
@@ -253,11 +283,12 @@ impl ArgTemplate {
             let segment = match name {
                 TARGET_PLACEHOLDER => Segment::Target,
                 COMMAND_PLACEHOLDER => Segment::Command,
+                SSH_OPTIONS_PLACEHOLDER => Segment::SshOptions,
                 _ => {
                     return Err(format!(
                         "unknown placeholder {{{name}}}; supported placeholders are \
-                         {{{TARGET_PLACEHOLDER}}} and {{{COMMAND_PLACEHOLDER}}} \
-                         (write {{{{ for a literal brace)"
+                         {{{TARGET_PLACEHOLDER}}}, {{{COMMAND_PLACEHOLDER}}}, and \
+                         {{{SSH_OPTIONS_PLACEHOLDER}}} (write {{{{ for a literal brace)"
                     ))
                 }
             };
@@ -292,44 +323,12 @@ impl ArgTemplate {
                 Segment::Literal(literal) => expanded.push_str(literal),
                 Segment::Target => expanded.push_str(target),
                 Segment::Command => expanded.push_str(remote_command),
+                // Parsing turns a lone {ssh_options} into Arg::SshOptions and
+                // rejects it anywhere else.
+                Segment::SshOptions => {}
             }
         }
         OsString::from(expanded)
-    }
-}
-
-fn apply_noninteractive_ssh_options(command: &mut Command) {
-    command
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-o")
-        .arg("NumberOfPasswordPrompts=0")
-        .arg("-o")
-        .arg("StrictHostKeyChecking=yes")
-        .arg("-o")
-        .arg("ConnectTimeout=10")
-        .arg("-o")
-        .arg("ConnectionAttempts=1")
-        .arg("-o")
-        .arg("ServerAliveInterval=15")
-        .arg("-o")
-        .arg("ServerAliveCountMax=4");
-}
-
-fn apply_managed_ssh_options(command: &mut Command, options: Option<&ManagedSshOptions>) {
-    let Some(options) = options else {
-        return;
-    };
-
-    command.arg("-F").arg(&options.config_path);
-    if let Some(control_path) = &options.control_path {
-        command
-            .arg("-S")
-            .arg(control_path)
-            .arg("-o")
-            .arg("ControlMaster=auto")
-            .arg("-o")
-            .arg("ControlPersist=yes");
     }
 }
 
@@ -368,16 +367,24 @@ mod tests {
     }
 
     fn launcher(config: &crate::config::RemoteCommandConfig) -> RemoteLauncher {
-        RemoteLauncher::Program(RemoteProgram::from_config(config).expect("valid launcher"))
+        RemoteLauncher::new(config).expect("valid launcher")
+    }
+
+    fn default_launcher() -> RemoteLauncher {
+        launcher(&crate::config::RemoteCommandConfig::default())
+    }
+
+    fn managed_options() -> ManagedSshOptions {
+        ManagedSshOptions {
+            config_path: PathBuf::from("/tmp/herdr/config"),
+            control_path: Some(PathBuf::from("/tmp/herdr/ctl")),
+        }
     }
 
     #[test]
-    fn ssh_stays_the_default_launcher_shape() {
-        let command = RemoteLauncher::ssh(None, false).command(
-            "host",
-            "herdr remote-client-bridge",
-            RemoteStdin::Piped,
-        );
+    fn the_default_launcher_is_plain_ssh() {
+        let command =
+            default_launcher().command("host", "herdr remote-client-bridge", RemoteStdin::Piped);
 
         assert_eq!(command.get_program(), "ssh");
         assert_eq!(
@@ -388,35 +395,55 @@ mod tests {
 
     #[test]
     fn ssh_refuses_stdin_for_commands_that_never_write_it() {
-        let command =
-            RemoteLauncher::ssh(None, false).command("host", "uname -s", RemoteStdin::Null);
+        let command = default_launcher().command("host", "uname -s", RemoteStdin::Null);
 
-        assert_eq!(argv(&command), vec!["-T", "host", "-n", "uname -s"]);
+        assert_eq!(argv(&command), vec!["-n", "-T", "host", "uname -s"]);
     }
 
     #[test]
-    fn ssh_keeps_managed_and_noninteractive_options_before_the_target() {
-        let options = ManagedSshOptions {
-            config_path: PathBuf::from("/tmp/herdr/config"),
-            control_path: Some(PathBuf::from("/tmp/herdr/ctl")),
-        };
-        let command =
-            RemoteLauncher::ssh(Some(options), true).command("host", "true", RemoteStdin::Piped);
+    fn ssh_options_expand_where_the_template_asks_for_them() {
+        let command = default_launcher()
+            .with_ssh_options(Some(managed_options()), true)
+            .command("host", "true", RemoteStdin::Piped);
         let args = argv(&command);
 
-        assert_eq!(&args[..2], ["-F", "/tmp/herdr/config"]);
-        assert!(args.iter().any(|arg| arg == "BatchMode=yes"));
+        assert_eq!(
+            &args[..8],
+            [
+                "-F",
+                "/tmp/herdr/config",
+                "-S",
+                "/tmp/herdr/ctl",
+                "-o",
+                "ControlMaster=auto",
+                "-o",
+                "ControlPersist=yes",
+            ]
+        );
+        for required in [
+            "BatchMode=yes",
+            "NumberOfPasswordPrompts=0",
+            "StrictHostKeyChecking=yes",
+            "ConnectTimeout=10",
+            "ConnectionAttempts=1",
+            "ServerAliveInterval=15",
+            "ServerAliveCountMax=4",
+        ] {
+            assert!(args.iter().any(|arg| arg == required), "missing {required}");
+        }
         assert_eq!(&args[args.len() - 3..], ["-T", "host", "true"]);
     }
 
     #[test]
-    fn configured_launcher_spawns_the_executable_directly() {
+    fn a_configured_program_asks_for_no_ssh_options() {
         let launcher = launcher(&openshell_config());
-        let command = launcher.command(
-            "sandbox-1",
-            "herdr remote-client-bridge",
-            RemoteStdin::Piped,
-        );
+        assert!(!launcher.uses_ssh_options());
+
+        // Even handed Herdr's OpenSSH options, a template that never asks for
+        // them cannot receive them.
+        let command = launcher
+            .with_ssh_options(Some(managed_options()), true)
+            .command("sandbox-1", "herdr remote-client-bridge", RemoteStdin::Null);
 
         assert_eq!(command.get_program(), "openshell");
         assert_eq!(
@@ -432,8 +459,11 @@ mod tests {
                 "herdr remote-client-bridge",
             ]
         );
-        assert_eq!(launcher.program_name(), "openshell");
-        assert!(launcher.control_exit_command("sandbox-1").is_none());
+    }
+
+    #[test]
+    fn the_default_launcher_asks_for_ssh_options() {
+        assert!(default_launcher().uses_ssh_options());
     }
 
     #[test]
@@ -478,28 +508,30 @@ mod tests {
     }
 
     #[test]
-    fn probe_launcher_drops_ssh_reuse_but_keeps_a_configured_program() {
-        let options = ManagedSshOptions {
-            config_path: PathBuf::from("/tmp/herdr/config"),
-            control_path: Some(PathBuf::from("/tmp/herdr/ctl")),
-        };
-        let ssh = RemoteLauncher::ssh(Some(options), false).probe();
-        assert_eq!(ssh, RemoteLauncher::ssh(None, true));
+    fn probe_launcher_drops_connection_reuse_and_prompts() {
+        let probe = default_launcher()
+            .with_ssh_options(Some(managed_options()), false)
+            .probe();
 
+        let args = argv(&probe.command("host", "true", RemoteStdin::Piped));
+        assert!(!args.iter().any(|arg| arg == "-F"));
+        assert!(args.iter().any(|arg| arg == "BatchMode=yes"));
+
+        // A template that never asks for ssh options probes unchanged.
         let program = launcher(&openshell_config());
-        assert_eq!(program.probe(), program);
+        assert_eq!(
+            argv(&program.probe().command("host", "true", RemoteStdin::Piped)),
+            argv(&program.command("host", "true", RemoteStdin::Piped))
+        );
     }
 
     #[test]
     fn managed_ssh_control_socket_has_a_shutdown_command() {
-        let options = ManagedSshOptions {
-            config_path: PathBuf::from("/tmp/herdr/config"),
-            control_path: Some(PathBuf::from("/tmp/herdr/ctl")),
-        };
-        let command = RemoteLauncher::ssh(Some(options), false)
+        let command = managed_options()
             .control_exit_command("host")
             .expect("managed control socket exits");
 
+        assert_eq!(command.get_program(), "ssh");
         assert_eq!(
             argv(&command),
             vec![
@@ -518,9 +550,12 @@ mod tests {
                 "host",
             ]
         );
-        assert!(RemoteLauncher::ssh(None, false)
-            .control_exit_command("host")
-            .is_none());
+        assert!(ManagedSshOptions {
+            config_path: PathBuf::from("/tmp/herdr/config"),
+            control_path: None,
+        }
+        .control_exit_command("host")
+        .is_none());
     }
 
     #[test]
@@ -550,71 +585,32 @@ mod tests {
                 program_config("openshell", &["{target}", "{command"]),
                 "unterminated placeholder",
             ),
+            (
+                program_config("ssh", &["-o{ssh_options}", "{target}", "{command}"]),
+                "must be an argument of its own",
+            ),
         ] {
-            let error = RemoteProgram::from_config(&config).expect_err("rejected configuration");
+            let error = RemoteLauncher::new(&config).expect_err("rejected configuration");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
             assert!(
-                error.contains(expected),
-                "expected {expected:?} in {error:?}"
+                error.to_string().contains(expected),
+                "expected {expected:?} in {error}"
             );
         }
     }
 
     #[test]
     fn unknown_placeholder_error_points_at_the_offending_argument() {
-        let error = RemoteProgram::from_config(&program_config(
+        let error = RemoteLauncher::new(&program_config(
             "openshell",
             &["{target}", "{oops}", "{command}"],
         ))
         .expect_err("rejected configuration");
 
-        assert!(error.starts_with("remote.command.args[1]:"), "{error}");
-    }
-
-    #[test]
-    fn unset_remote_command_keeps_the_ssh_default() {
-        let config = crate::config::RemoteConfig::default();
-
-        assert_eq!(
-            configured_launcher(&config, false).expect("default config is valid"),
-            ConfiguredLauncher::Ssh {
-                manage_config: true
-            }
+        assert!(
+            error.to_string().starts_with("remote.command.args[1]:"),
+            "{error}"
         );
-        assert_eq!(
-            configured_launcher(&config, true).expect("default config is valid"),
-            ConfiguredLauncher::Ssh {
-                manage_config: false
-            }
-        );
-    }
-
-    #[test]
-    fn configured_remote_command_replaces_ssh_for_every_caller() {
-        let config = crate::config::RemoteConfig {
-            manage_ssh_config: true,
-            command: Some(openshell_config()),
-        };
-        let expected =
-            ConfiguredLauncher::Program(RemoteProgram::from_config(&openshell_config()).unwrap());
-
-        for noninteractive in [false, true] {
-            assert_eq!(
-                configured_launcher(&config, noninteractive).expect("valid launcher"),
-                expected
-            );
-        }
-    }
-
-    #[test]
-    fn invalid_remote_command_configuration_is_rejected_instead_of_falling_back_to_ssh() {
-        let config = crate::config::RemoteConfig {
-            manage_ssh_config: true,
-            command: Some(program_config("openshell", &["{target}"])),
-        };
-
-        let error = configured_launcher(&config, false).expect_err("rejected configuration");
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-        assert!(error.to_string().contains("{command}"), "{error}");
     }
 }
 
@@ -626,6 +622,22 @@ mod process_tests {
     use std::io::{BufRead as _, BufReader, Read as _, Write as _};
     use std::os::unix::fs::PermissionsExt as _;
     use std::process::Stdio;
+
+    /// Exec'ing a file this test just wrote races with any other test's fork:
+    /// between fork and exec the child holds an inherited write handle and the
+    /// exec fails with ETXTBSY. `cargo nextest` runs one test per process, so
+    /// this only bites plain `cargo test`.
+    fn spawn(command: &mut Command) -> std::process::Child {
+        for _ in 0..50 {
+            match command.spawn() {
+                Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                result => return result.expect("spawn configured launcher"),
+            }
+        }
+        panic!("the fake launcher stayed busy");
+    }
 
     struct FakeLauncher {
         dir: std::path::PathBuf,
@@ -675,16 +687,14 @@ mod process_tests {
         }
 
         fn launcher(&self, status: &str) -> RemoteLauncher {
-            RemoteLauncher::Program(
-                RemoteProgram::from_config(&crate::config::RemoteCommandConfig {
-                    program: self.program(),
-                    args: [status, "exec", "-n", "{target}", "--", "{command}"]
-                        .iter()
-                        .map(|arg| (*arg).to_string())
-                        .collect(),
-                })
-                .expect("valid launcher"),
-            )
+            RemoteLauncher::new(&crate::config::RemoteCommandConfig {
+                program: self.program(),
+                args: [status, "exec", "-n", "{target}", "--", "{command}"]
+                    .iter()
+                    .map(|arg| (*arg).to_string())
+                    .collect(),
+            })
+            .expect("valid launcher")
         }
     }
 
@@ -697,13 +707,12 @@ mod process_tests {
             canary.display()
         );
 
-        let mut child = fake
-            .launcher("0")
-            .command("host name", &remote_command, RemoteStdin::Piped)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .spawn()
-            .expect("spawn configured launcher");
+        let mut child = spawn(
+            fake.launcher("0")
+                .command("host name", &remote_command, RemoteStdin::Piped)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null()),
+        );
         assert!(child.wait().expect("launcher exits").success());
 
         // One argv element each, byte for byte, and no shell ran the remote
@@ -727,13 +736,12 @@ mod process_tests {
     #[test]
     fn configured_launcher_keeps_stdin_and_stdout_usable_for_the_bridge() {
         let fake = FakeLauncher::new("bridge");
-        let mut child = fake
-            .launcher("0")
-            .command("host", "herdr remote-client-bridge", RemoteStdin::Piped)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("spawn configured launcher");
+        let mut child = spawn(
+            fake.launcher("0")
+                .command("host", "herdr remote-client-bridge", RemoteStdin::Piped)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped()),
+        );
         let mut stdin = child.stdin.take().expect("bridge stdin");
         let mut stdout = BufReader::new(child.stdout.take().expect("bridge stdout"));
 
@@ -758,32 +766,31 @@ mod process_tests {
     #[test]
     fn configured_launcher_reports_the_programs_exit_status() {
         let fake = FakeLauncher::new("status");
-        let status = fake
-            .launcher("7")
-            .command("host", "herdr remote-client-bridge", RemoteStdin::Piped)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .status()
-            .expect("run configured launcher");
+        let status = spawn(
+            fake.launcher("7")
+                .command("host", "herdr remote-client-bridge", RemoteStdin::Piped)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null()),
+        )
+        .wait()
+        .expect("run configured launcher");
 
         assert_eq!(status.code(), Some(7));
     }
 
     #[test]
     fn missing_launcher_program_fails_at_spawn_like_a_missing_ssh() {
-        let launcher = RemoteLauncher::Program(
-            RemoteProgram::from_config(&crate::config::RemoteCommandConfig {
-                program: "/nonexistent/herdr-remote-launcher".to_string(),
-                args: vec!["{target}".to_string(), "{command}".to_string()],
-            })
-            .expect("valid launcher"),
-        );
+        let launcher = RemoteLauncher::new(&crate::config::RemoteCommandConfig {
+            program: "/nonexistent/herdr-remote-launcher".to_string(),
+            args: vec!["{target}".to_string(), "{command}".to_string()],
+        })
+        .expect("valid launcher");
 
         let error = launcher
             .command("host", "true", RemoteStdin::Piped)
             .spawn()
             .expect_err("missing program");
 
-        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
     }
 }

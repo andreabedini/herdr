@@ -1020,19 +1020,19 @@ pub struct AdvancedConfig {
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct RemoteConfig {
-    /// Add keepalive fallbacks and private connection reuse for `herdr --remote`.
-    /// Set false to run plain ssh unchanged. Default: true.
+    /// Add keepalive fallbacks and private connection reuse to the `{ssh_options}`
+    /// of `remote.command`. Set false to run ssh unchanged. Default: true.
     pub manage_ssh_config: bool,
-    /// Local launcher that runs remote commands for `herdr --remote` and saved
-    /// SSH machines. Unset (default) runs `ssh` with Herdr's own options.
-    pub command: Option<RemoteCommandConfig>,
+    /// Local program that runs one remote command for `herdr --remote` and saved
+    /// SSH machines. Default: Herdr's own ssh invocation.
+    pub command: RemoteCommandConfig,
 }
 
 impl Default for RemoteConfig {
     fn default() -> Self {
         Self {
             manage_ssh_config: true,
-            command: None,
+            command: RemoteCommandConfig::default(),
         }
     }
 }
@@ -1040,16 +1040,32 @@ impl Default for RemoteConfig {
 /// Executable and argv template Herdr spawns to run one remote command.
 /// Herdr never runs a local shell, so the program and every argument stay
 /// separate argv elements.
-#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct RemoteCommandConfig {
     /// Executable Herdr spawns directly, without a local shell. Placeholders are
-    /// not expanded here. Default: unset (Herdr runs `ssh`).
+    /// not expanded here. Default: "ssh".
+    #[serde(default)]
     pub program: String,
     /// Arguments passed to `remote.command.program`. Each entry stays one argv
-    /// element; `{target}` expands to the `--remote` target and `{command}` to the
-    /// remote command string. Write `{{` for a literal brace. Default: unset.
+    /// element: `{target}` expands to the `--remote` target and `{command}` to the
+    /// remote command string. `{ssh_options}` must stand alone and expands to the
+    /// OpenSSH options Herdr manages for the call, so only an ssh command wants
+    /// it. Write `{{` for a literal brace.
+    /// Default: ["{ssh_options}", "-T", "{target}", "{command}"].
+    #[serde(default)]
     pub args: Vec<String>,
+}
+
+impl Default for RemoteCommandConfig {
+    fn default() -> Self {
+        Self {
+            program: "ssh".into(),
+            args: ["{ssh_options}", "-T", "{target}", "{command}"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1310,6 +1326,34 @@ impl Default for AdvancedConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_command_defaults_to_herdrs_ssh_invocation() {
+        let config: Config = toml::from_str("").unwrap();
+
+        assert_eq!(config.remote.command, RemoteCommandConfig::default());
+        assert_eq!(config.remote.command.program, "ssh");
+        assert_eq!(
+            config.remote.command.args,
+            ["{ssh_options}", "-T", "{target}", "{command}"]
+        );
+    }
+
+    #[test]
+    fn a_configured_remote_command_never_inherits_the_ssh_arguments() {
+        let config: Config = toml::from_str(
+            r#"
+[remote.command]
+program = "openshell"
+"#,
+        )
+        .unwrap();
+
+        // Inheriting ssh's own arguments here would hand another program `-T`
+        // and a bare target. The launcher rejects the empty list instead.
+        assert_eq!(config.remote.command.program, "openshell");
+        assert!(config.remote.command.args.is_empty());
+    }
 
     #[test]
     fn update_config_defaults_and_parses() {
